@@ -1,0 +1,8 @@
+[package]
+name = "fips205"
+edition = "2024"
+
+[dependencies]
+
+[addresses]
+fips205 = "0x0"
