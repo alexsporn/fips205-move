@@ -16,6 +16,15 @@ module fips205::slh_dsa_sha2_128s {
     use fips205::params;
     use fips205::slh_dsa;
 
+    // === Size constants ===
+
+    /// Public key length: 32 bytes (PK.seed || PK.root).
+    public fun pk_len(): u64 { 32 }
+    /// Full signature length: 7,856 bytes.
+    public fun sig_len(): u64 { 7856 }
+
+    // === Verification ===
+
     /// Verify an SLH-DSA-SHA2-128s signature (pure variant, empty context).
     ///
     /// `msg`: arbitrary-length message.
