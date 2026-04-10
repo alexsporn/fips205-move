@@ -24,7 +24,8 @@
 /// ## Compressed Form (22 bytes)
 ///
 /// For SHA-256 tweakable hash inputs, the ADRS is compressed to 22 bytes by keeping
-/// only the least significant bytes of small fields. See `compress()`.
+/// only the least significant bytes of small fields (FIPS 205 Algorithm 24).
+/// The compression is inlined at each call site for gas efficiency.
 module fips205::adrs {
 
     // --- Address type constants (FIPS 205 Table 2) ---
@@ -113,34 +114,6 @@ module fips205::adrs {
     /// Get key pair address (bytes 20-23).
     public(package) fun get_keypair(adrs: &vector<u8>): u32 {
         get_u32(adrs, 20)
-    }
-
-    /// Compress ADRS to 22 bytes for SHA-256 tweakable hash input (FIPS 205 Algorithm 24).
-    ///
-    /// The compressed form drops redundant high bytes from fields that are small enough
-    /// for SHA2-128s. This is the `ADRSc` value used in the SHA-256 hash input layout:
-    /// `PK.seed(16) || 0^48 || ADRSc(22) || message(...)`.
-    ///
-    /// Layout: `layer_lsb(1) || tree_addr(8) || type_lsb(1) || keypair(4) || chain(4) || hash(4)`
-    public(package) fun compress(adrs: &vector<u8>): vector<u8> {
-        let mut c = vector[];
-        // Byte 3: LSB of layer address
-        c.push_back(adrs[3]);
-        // Bytes 8-15: tree address (high + low)
-        let mut i = 8;
-        while (i < 16) {
-            c.push_back(adrs[i]);
-            i = i + 1;
-        };
-        // Byte 19: LSB of type
-        c.push_back(adrs[19]);
-        // Bytes 20-31: fields 5, 6, 7
-        let mut i = 20;
-        while (i < 32) {
-            c.push_back(adrs[i]);
-            i = i + 1;
-        };
-        c
     }
 
     // --- Internal helpers ---
