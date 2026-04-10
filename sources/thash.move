@@ -12,12 +12,6 @@
 ///
 /// All outputs are truncated from 32 bytes (SHA-256) to n bytes.
 ///
-/// ## SHA-256 Specificity
-///
-/// This module is specific to SHA-256-based variants (SLH-DSA-SHA2-128s/128f).
-/// Future SHA-512-based variants (192s/192f/256s/256f) would need a parallel
-/// `thash_sha512` module with 128-byte block padding and SHA-512 calls.
-///
 /// ## Gas Optimizations
 ///
 /// - `padded_pk_seed` (pk_seed || zeros to 64 bytes) is precomputed once per
@@ -27,6 +21,9 @@
 /// - `truncate_n` uses `pop_back` instead of allocating a new vector.
 /// - `append` calls are replaced with `push_back` loops to avoid the expensive
 ///   internal `reverse` operation that `vector::append` performs.
+/// - Offset-based variants (`f_from`, `h_right_from`, `h_left_from`) read
+///   message bytes directly from a source vector at an offset, eliminating
+///   intermediate `utils::slice` allocations in hot paths.
 module fips205::thash {
     use std::hash;
     use fips205::params::{Self, Params};
@@ -53,8 +50,7 @@ module fips205::thash {
     /// Build the tweakable hash input prefix: `padded_pk_seed(64) || ADRS_c(22)`.
     ///
     /// Inlines the ADRS compression (FIPS 205 Algorithm 24) to avoid creating an
-    /// intermediate 22-byte vector and the expensive `vector::append` (which
-    /// internally reverses the source vector).
+    /// intermediate 22-byte vector and the expensive `vector::append`.
     ///
     /// Compressed ADRS layout (22 bytes):
     /// `layer_lsb(1) || tree_addr(8) || type_lsb(1) || keypair(4) || chain(4) || hash(4)`
@@ -87,12 +83,9 @@ module fips205::thash {
     }
 
     /// Truncate a 32-byte SHA-256 digest to n bytes (in-place via pop_back).
-    ///
-    /// Avoids allocating a new vector; instead removes excess trailing bytes.
     fun truncate_n(mut digest: vector<u8>, p: &Params): vector<u8> {
         let n = params::n(p);
-        let len = digest.length();
-        let to_remove = len - n;
+        let to_remove = digest.length() - n;
         let mut i = 0;
         while (i < to_remove) {
             digest.pop_back();
@@ -103,10 +96,8 @@ module fips205::thash {
 
     /// F: single-block tweakable hash (FIPS 205 Section 11.1).
     ///
-    /// Used for WOTS+ chain steps and FORS leaf hashing.
-    /// Input: `prefix || m(n)`. Output: n bytes.
-    ///
-    /// This is the most frequently called hash function (~85% of verification gas).
+    /// Message is read from a separate vector.
+    /// For the hot-path chain loop, use the fused chain in wots.move instead.
     public(package) fun f(
         padded_pk_seed: &vector<u8>,
         adrs: &vector<u8>,
@@ -123,10 +114,30 @@ module fips205::thash {
         truncate_n(hash::sha2_256(input), p)
     }
 
+    /// F with offset: reads n message bytes from `source[offset .. offset+n]`.
+    ///
+    /// Avoids creating an intermediate slice vector when the message bytes are
+    /// part of a larger signature buffer.
+    public(package) fun f_from(
+        padded_pk_seed: &vector<u8>,
+        adrs: &vector<u8>,
+        source: &vector<u8>,
+        offset: u64,
+        p: &Params,
+    ): vector<u8> {
+        let n = params::n(p);
+        let mut input = build_prefix(padded_pk_seed, adrs);
+        let mut i = 0;
+        while (i < n) {
+            input.push_back(source[offset + i]);
+            i = i + 1;
+        };
+        truncate_n(hash::sha2_256(input), p)
+    }
+
     /// H: two-block tweakable hash for Merkle tree nodes (FIPS 205 Section 11.1).
     ///
     /// Computes parent from left child `m1` and right child `m2`.
-    /// Input: `prefix || m1(n) || m2(n)`. Output: n bytes.
     public(package) fun h(
         padded_pk_seed: &vector<u8>,
         adrs: &vector<u8>,
@@ -149,10 +160,61 @@ module fips205::thash {
         truncate_n(hash::sha2_256(input), p)
     }
 
+    /// H with right child from offset: `m1` is a vector, right child read from
+    /// `source[offset .. offset+n]`. Used for auth paths where the auth node
+    /// comes from the signature buffer and the computed node is the left child.
+    public(package) fun h_right_from(
+        padded_pk_seed: &vector<u8>,
+        adrs: &vector<u8>,
+        m1: &vector<u8>,
+        source: &vector<u8>,
+        offset: u64,
+        p: &Params,
+    ): vector<u8> {
+        let n = params::n(p);
+        let mut input = build_prefix(padded_pk_seed, adrs);
+        let mut i = 0;
+        while (i < n) {
+            input.push_back(m1[i]);
+            i = i + 1;
+        };
+        i = 0;
+        while (i < n) {
+            input.push_back(source[offset + i]);
+            i = i + 1;
+        };
+        truncate_n(hash::sha2_256(input), p)
+    }
+
+    /// H with left child from offset: left child read from
+    /// `source[offset .. offset+n]`, `m2` is a vector. Used for auth paths
+    /// where the auth node is the left child.
+    public(package) fun h_left_from(
+        padded_pk_seed: &vector<u8>,
+        adrs: &vector<u8>,
+        source: &vector<u8>,
+        offset: u64,
+        m2: &vector<u8>,
+        p: &Params,
+    ): vector<u8> {
+        let n = params::n(p);
+        let mut input = build_prefix(padded_pk_seed, adrs);
+        let mut i = 0;
+        while (i < n) {
+            input.push_back(source[offset + i]);
+            i = i + 1;
+        };
+        i = 0;
+        while (i < n) {
+            input.push_back(m2[i]);
+            i = i + 1;
+        };
+        truncate_n(hash::sha2_256(input), p)
+    }
+
     /// T_l: multi-block tweakable hash for public key compression (FIPS 205 Section 11.1).
     ///
     /// Compresses `l` hash values (flat `ml` of `l * n` bytes) into n bytes.
-    /// Used as T_len (WOTS+ pk, l=len) and T_k (FORS roots, l=k).
     public(package) fun t_l(
         padded_pk_seed: &vector<u8>,
         adrs: &vector<u8>,
@@ -160,7 +222,6 @@ module fips205::thash {
         p: &Params,
     ): vector<u8> {
         let mut input = build_prefix(padded_pk_seed, adrs);
-        // Append ml using push_back to avoid vector::append's internal reverse
         let ml_len = ml.length();
         let mut i = 0;
         while (i < ml_len) {
@@ -171,9 +232,6 @@ module fips205::thash {
     }
 
     /// H_msg: message digest using MGF1-SHA-256 (FIPS 205 Section 11.2).
-    ///
-    /// Produces an m-byte digest from the message, randomness, and public key.
-    /// The output is split by the caller into FORS indices, tree index, and leaf index.
     ///
     /// Note: This function uses raw pk_seed (not padded) since it has a different
     /// hash input structure that doesn't use the tweakable hash prefix.
@@ -226,7 +284,6 @@ module fips205::thash {
         let mut result = vector[];
         let mut counter: u32 = 0;
         while (result.length() < m) {
-            // SHA-256(seed || counter_be32)
             let mut mgf_input = seed;
             mgf_input.push_back(((counter >> 24) as u8));
             mgf_input.push_back((((counter >> 16) & 0xFF) as u8));
@@ -234,7 +291,6 @@ module fips205::thash {
             mgf_input.push_back(((counter & 0xFF) as u8));
             let block = hash::sha2_256(mgf_input);
 
-            // Append min(32, m - result.length()) bytes
             let remaining = m - result.length();
             let take = if (remaining < 32) { remaining } else { 32 };
             let mut j = 0;

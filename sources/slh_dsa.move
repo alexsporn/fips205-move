@@ -4,22 +4,12 @@
 /// by the parameter-set-specific entry points (`slh_dsa_sha2_128s`, `slh_dsa_sha2_128f`)
 /// which supply the correct `Params`.
 ///
-/// ## Verification Flow
-///
-/// 1. Validate public key and signature lengths against the parameter set
-/// 2. Parse PK into `pk_seed` and `pk_root` (n bytes each)
-/// 3. Parse signature into randomness R, FORS signature, and hypertree signature
-/// 4. Wrap message for the "pure" variant: `[0x00, 0x00] || msg`
-/// 5. Compute m-byte message digest via H_msg (MGF1-SHA-256)
-/// 6. Extract FORS indices (`md`), tree index, and leaf index from the digest
-/// 7. Recover the FORS public key from the FORS signature
-/// 8. Verify the hypertree signature chains up to `pk_root`
-///
 /// ## Gas Optimizations
 ///
-/// The padded PK.seed (`pk_seed || zeros(48)`) is precomputed once here and
-/// threaded through the entire call chain (ht -> xmss -> wots -> thash),
-/// eliminating ~2,188 redundant zero-padding constructions.
+/// - The padded PK.seed is precomputed once and threaded through the entire
+///   call chain.
+/// - The full signature vector is passed by reference with offsets to fors and ht,
+///   eliminating the large sig_fors and sig_ht slice allocations.
 module fips205::slh_dsa {
     use fips205::adrs;
     use fips205::thash;
@@ -30,16 +20,8 @@ module fips205::slh_dsa {
 
     /// Verify an SLH-DSA signature using the given parameter set.
     ///
-    /// This is the "pure" variant with empty context (`ctx = []`).
-    /// The message is internally prepended with `[0x00, 0x00]` per FIPS 205 Section 10.2.
-    ///
-    /// `msg`: arbitrary-length message.
-    /// `sig`: signature bytes (length must match `params.sig_len`).
-    /// `pk`:  public key bytes (length must match `params.pk_len`).
-    /// `ctx`: context string (0-255 bytes) for domain separation.
-    /// `p`:   parameter set configuration.
-    ///
-    /// Returns true iff the signature is valid.
+    /// This is the "pure" variant. The message is internally prepended with
+    /// context wrapping per FIPS 205 Section 10.2.
     public(package) fun verify(
         msg: &vector<u8>,
         sig: &vector<u8>,
@@ -73,8 +55,6 @@ module fips205::slh_dsa {
     ///
     /// Verifies a signature against a pre-processed message (already includes any
     /// context wrapping). This is the raw algorithm used by NIST ACVP test vectors.
-    ///
-    /// For normal use, call `verify()` instead, which handles context wrapping.
     public(package) fun verify_internal(
         msg: &vector<u8>,
         sig: &vector<u8>,
@@ -94,11 +74,11 @@ module fips205::slh_dsa {
         // Precompute padded pk_seed once for entire verification
         let padded_pk_seed = thash::pad_pk_seed(&pk_seed, p);
 
-        // Parse signature: R(n) || sig_fors || sig_ht
+        // Signature layout: R(n) || sig_fors(fors_sig_len) || sig_ht(d * xmss_sig_len)
+        // We pass the full sig with offsets instead of slicing.
         let r = utils::slice(sig, 0, n);
-        let fors_end = n + params::fors_sig_len(p);
-        let sig_fors = utils::slice(sig, n, fors_end);
-        let sig_ht = utils::slice(sig, fors_end, params::sig_len(p));
+        let fors_offset = n;
+        let ht_offset = n + params::fors_sig_len(p);
 
         // Compute m-byte message digest (uses raw pk_seed, not padded)
         let digest = thash::h_msg(&r, &pk_seed, &pk_root, msg, p);
@@ -125,12 +105,14 @@ module fips205::slh_dsa {
         adrs::set_type_and_clear(&mut sig_adrs, adrs::type_fors_tree());
         adrs::set_keypair(&mut sig_adrs, idx_leaf);
 
-        // Recover FORS public key from signature
+        // Recover FORS public key from signature (reads from sig at fors_offset)
         let pk_fors = fors::fors_pk_from_sig(
-            &sig_fors, &md, &padded_pk_seed, &mut sig_adrs, p,
+            sig, fors_offset, &md, &padded_pk_seed, &mut sig_adrs, p,
         );
 
-        // Verify hypertree signature
-        ht::ht_verify(&pk_fors, &sig_ht, &padded_pk_seed, idx_tree, idx_leaf, &pk_root, p)
+        // Verify hypertree signature (reads from sig at ht_offset)
+        ht::ht_verify(
+            &pk_fors, sig, ht_offset, &padded_pk_seed, idx_tree, idx_leaf, &pk_root, p,
+        )
     }
 }
