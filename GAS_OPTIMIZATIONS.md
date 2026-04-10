@@ -1,36 +1,29 @@
 # Gas Optimizations
 
 Analysis and optimizations applied to reduce Move VM gas consumption during
-SLH-DSA signature verification. Two rounds of optimization were performed.
+SLH-DSA signature verification. Three rounds of optimization were performed.
 
 ## Results
 
-| Metric | Baseline | Round 1 | Round 2 |
-|---|---|---|---|
-| **Total gas** | **3,857,031,826** | **1,582,057,847** (-59.0%) | **1,032,063,672** (-73.2%) |
-| VM events | 58,734 | 39,658 (-32.5%) | 12,464 (-78.8%) |
+| Metric | Baseline | Round 1 | Round 2 | Round 3 |
+|---|---|---|---|---|
+| **Total gas** | **3,857,031,826** | **1,582,057,847** (-59.0%) | **1,032,063,672** (-73.2%) | **923,434,412** (-76.1%) |
+| VM events | 58,734 | 39,658 (-32.5%) | 12,464 (-78.8%) | 12,344 (-79.0%) |
 
 ### Per-function comparison (self gas)
 
-| Function | Baseline | After Round 1 | After Round 2 |
-|---|---|---|---|
-| `thash::build_prefix` | 825M (21.4%) | 258M (16.3%) | 15M (1.5%) |
-| `vector::append` | 689M (17.9%) | **eliminated** | **eliminated** |
-| `adrs::compress` | 516M (13.4%) | **eliminated** | **eliminated** |
-| `thash::truncate_n` | 449M (11.7%) | 270M (17.0%) | 16M (1.6%) |
-| `thash::f` | 427M (11.1%) | 416M (26.3%) | **absorbed into fused chain** |
-| `vector::reverse` | 395M (10.2%) | **eliminated** | **eliminated** |
-| `utils::slice` | 216M (5.6%) | 213M (13.5%) | **eliminated** |
-| `adrs::set_u32` | 91M (2.4%) | 89M (5.6%) | 20M (1.9%) |
-| `hash::sha2_256` | 47M (1.2%) | 46M (2.9%) | 46M (4.4%) |
-| `wots::chain` (fused) | 33M (0.9%) | 33M (2.1%) | 747M (72.4%) |
-
-Seven functions were completely eliminated from the profile. The fused chain
-now contains 72.4% of all gas — it absorbed work previously spread across
-`thash::f`, `build_prefix`, `truncate_n`, `utils::slice`, and `adrs::set_hash`.
-The `build_prefix` and `truncate_n` calls dropped from ~2,158 to 253 (only
-non-chain callers remain). `adrs::set_u32` dropped from 2,785 to 880 calls
-(1,905 chain `set_hash` calls eliminated).
+| Function | Baseline | After Round 1 | After Round 2 | After Round 3 |
+|---|---|---|---|---|
+| `thash::build_prefix` | 825M (21.4%) | 258M (16.3%) | 15M (1.5%) | 15M (1.7%) |
+| `vector::append` | 689M (17.9%) | **eliminated** | **eliminated** | **eliminated** |
+| `adrs::compress` | 516M (13.4%) | **eliminated** | **eliminated** | **eliminated** |
+| `thash::truncate_n` | 449M (11.7%) | 270M (17.0%) | 16M (1.6%) | 16M (1.8%) |
+| `thash::f` | 427M (11.1%) | 416M (26.3%) | **absorbed into chain** | **absorbed** |
+| `vector::reverse` | 395M (10.2%) | **eliminated** | **eliminated** | **eliminated** |
+| `utils::slice` | 216M (5.6%) | 213M (13.5%) | **eliminated** | **eliminated** |
+| `adrs::set_u32` | 91M (2.4%) | 89M (5.6%) | 20M (1.9%) | 20M (2.2%) |
+| `hash::sha2_256` | 47M (1.2%) | 46M (2.9%) | 46M (4.4%) | 44M (4.8%) |
+| `wots::chain` (fused) | 33M (0.9%) | 33M (2.1%) | 747M (72.4%) | 639M (69.2%) |
 
 ## Baseline Profile (SLH-DSA-SHA2-128s transfer)
 
@@ -166,17 +159,6 @@ calls remain). `truncate_n` dropped from 270M to 16M. `thash::f` was
 completely eliminated (absorbed into the fused chain). `adrs::set_u32` dropped
 from 89M to 20M (1,905 fewer set_hash calls).
 
-**Input prefix template layout (86 bytes):**
-```
-[0..63]:  padded pk_seed (constant across all chains)
-[64]:     adrs[3]     — layer LSB
-[65..72]: adrs[8..15] — tree address
-[73]:     adrs[19]    — type LSB
-[74..77]: adrs[20..23] — keypair
-[78..81]: adrs[24..27] — chain (fixed within one chain call)
-[82..85]: adrs[28..31] — hash (updated per step via borrow_mut)
-```
-
 ### 6. Offset-based reads — eliminated nearly all utils::slice calls
 
 `utils::slice` (213M, 13.5%) created new vectors by push_back loop. 510 calls
@@ -219,18 +201,88 @@ Total gas: **1,032,063,672** (~1.03B, -73.2% from baseline, -34.8% from Round 1)
 | `thash::build_prefix` | 15M | 1.5% | 253 |
 | `utils::base_2b` | 7M | 0.7% | 15 |
 
-The fused chain now contains 72.4% of all gas. The remaining 27.6% is split
-across WOTS+ accumulation (62M), T_l compression (52M), irreducible SHA-256
-(46M), and auth path hashing (52M combined `h_left_from` / `h_right_from`).
-All other functions are under 2% each.
+The fused chain contained 72.4% of all gas. Remaining opportunities targeted
+the per-step overhead within the chain loop.
+
+## Round 3 Optimizations
+
+### 7. 102-byte template — eliminate push_back in chain steps
+
+The Round 2 fused chain used an 86-byte prefix template and appended 16
+message bytes per step via `push_back`. Each `push_back` includes capacity
+checks and potential resize overhead.
+
+**Fix:** The template is now 102 bytes (86 prefix + 16 message placeholder
+zeros). Per step, message bytes are written via `borrow_mut` into pre-allocated
+positions 86-101 instead of `push_back`. A single `copy(102)` replaces
+`copy(86) + 16 push_back`.
+
+### 8. Skip intermediate truncation — only truncate the final output
+
+SHA-256 produces 32 bytes but only 16 are needed (n=16). The Round 2 chain
+truncated via 16 `pop_back` operations after every step. However, the next
+step only reads the first 16 bytes of the previous output (`tmp[0..15]`),
+so the extra 16 bytes are harmless.
+
+**Fix:** Intermediate hash results are kept at 32 bytes. Only the final
+chain output is truncated to n bytes before returning. This eliminates
+~1,674 truncation loops (16 `pop_back` each = ~26,784 operations).
+
+### 9. Single-byte hash update — 1 borrow_mut instead of 4
+
+For all FIPS 205 variants, the Winternitz parameter w ≤ 256, so the hash
+step index j always fits in a single byte. The upper 3 bytes of the hash
+field (positions 82-84) are always zero, which is already set in the template.
+
+**Fix:** Only position 85 is updated per step (1 `borrow_mut` instead of 4).
+
+**Measured impact:** `wots::chain` dropped from 747M to 639M (-108M, -14.5%).
+Per intermediate step operations reduced from 36 (4 borrow_mut + 16 push_back
++ 16 pop_back) to 17 (1 borrow_mut + 16 borrow_mut), a 53% reduction.
+
+**Input template layout (102 bytes):**
+```
+[0..63]:   padded pk_seed (constant across all chains)
+[64]:      adrs[3]     — layer LSB
+[65..72]:  adrs[8..15] — tree address
+[73]:      adrs[19]    — type LSB
+[74..77]:  adrs[20..23] — keypair
+[78..81]:  adrs[24..27] — chain (fixed within one chain call)
+[82..85]:  0,0,0,0     — hash field (only byte 85 updated per step)
+[86..101]: 0..0        — message (16 bytes, updated per step via borrow_mut)
+```
+
+## Round 3 Profile (SLH-DSA-SHA2-128s transfer)
+
+Total gas: **923,434,412** (~923M, -76.1% from baseline, -10.5% from Round 2)
+
+### Top self-gas consumers after Round 3
+
+| Function | Self Gas | % | Calls |
+|---|---|---|---|
+| `wots::chain` (fused) | 639M | 69.2% | 245 |
+| `wots::wots_pk_from_sig` | 62M | 6.7% | 7 |
+| `thash::t_l` | 52M | 5.6% | 8 |
+| `hash::sha2_256` | 44M | 4.8% | 2,100 |
+| `thash::h_left_from` | 26M | 2.9% | 122 |
+| `thash::h_right_from` | 26M | 2.8% | 109 |
+| `adrs::set_u32` | 20M | 2.2% | 880 |
+| `thash::truncate_n` | 16M | 1.8% | 253 |
+| `thash::build_prefix` | 15M | 1.7% | 253 |
+| `utils::base_2b` | 7M | 0.8% | 15 |
+
+The remaining gas is dominated by the fused chain's irreducible per-step work
+(102-byte vector copy + 17 borrow_muts + SHA-256), WOTS+ accumulation (62M),
+T_l compression (52M), SHA-256 (44M), and auth path hashing (52M combined).
+Further gains require framework-level changes.
 
 ## Possible Future Optimizations
 
 ### SHA-256 midstate precomputation (framework-level)
 
 The first 64 bytes of every SHA-256 input (padded pk_seed) are identical across
-all ~2,160 hash calls. A framework native like `sha256_with_midstate(midstate,
+all ~2,100 hash calls. A framework native like `sha256_with_midstate(midstate,
 data)` would let us precompute the intermediate SHA-256 state after the first
-block and skip ~2,159 redundant compression function evaluations. Currently
-SHA-256 accounts for 46M (4.4%), but this percentage would grow if future
+block and skip ~2,099 redundant compression function evaluations. Currently
+SHA-256 accounts for 44M (4.8%), but this percentage would grow if future
 optimizations further reduce Move-level overhead.

@@ -7,15 +7,18 @@
 /// For all SHA2-128 variants (w=16): 35 chains, each of length 16 (steps 0..15).
 /// Average chain completion: 7.5 F calls per chain.
 ///
-/// ## Gas Optimizations (Round 2)
+/// ## Gas Optimizations (Round 3)
 ///
-/// The chain function is fully fused: it builds an 86-byte SHA-256 input prefix
-/// template once per chain, then per step only copies the template, updates
-/// 4 bytes (hash field) via borrow_mut, pushes 16 message bytes, hashes, and
-/// truncates inline. This eliminates ~1,674 separate build_prefix + truncate_n
-/// calls and ~1,905 adrs::set_hash calls.
-///
-/// Reads signature bytes at offsets (no intermediate slice vectors).
+/// The chain function is fully fused with three additional micro-optimizations:
+/// 1. **102-byte template**: Pre-allocates message space in the template. Per step,
+///    message bytes are written via `borrow_mut` instead of `push_back`, eliminating
+///    capacity checks and resize overhead.
+/// 2. **Skip intermediate truncation**: SHA-256 produces 32 bytes but only 16 are
+///    needed. Intermediate results are kept at 32 bytes — the next step reads only
+///    the first 16 — and truncation happens only on the final output.
+/// 3. **Single-byte hash update**: For w ≤ 256 (all FIPS 205 variants), the hash
+///    step index fits in one byte. The upper 3 bytes are pre-zeroed in the template,
+///    so only position 85 needs updating (1 borrow_mut instead of 4).
 ///
 /// ## References
 /// - FIPS 205 Algorithm 5 (chain)
@@ -104,20 +107,21 @@ module fips205::wots {
     /// Fused WOTS+ chain function (FIPS 205 Algorithm 5).
     ///
     /// Reads the initial chain value from `sig[sig_offset .. sig_offset+n]`.
-    /// Builds the 86-byte SHA-256 input prefix template once per chain, then
-    /// per step: copies template, updates 4 hash bytes, pushes 16 message bytes,
-    /// hashes, and truncates — all inline without calling thash::f/build_prefix/
-    /// truncate_n. Does NOT update adrs (caller doesn't need hash field after).
+    /// Builds a 102-byte SHA-256 input template once per chain (86-byte prefix +
+    /// 16-byte message placeholder), then per step: copies template, updates hash
+    /// byte and message bytes via borrow_mut, hashes, and skips truncation until
+    /// the final step.
     ///
-    /// Input prefix template layout (86 bytes):
+    /// Input template layout (102 bytes):
     /// ```
-    /// [0..63]:  padded pk_seed (constant)
-    /// [64]:     adrs[3]  — layer LSB
-    /// [65..72]: adrs[8..15] — tree address
-    /// [73]:     adrs[19] — type LSB
-    /// [74..77]: adrs[20..23] — keypair
-    /// [78..81]: adrs[24..27] — chain (fixed within this chain call)
-    /// [82..85]: adrs[28..31] — hash (updated per step via borrow_mut)
+    /// [0..63]:   padded pk_seed (constant)
+    /// [64]:      adrs[3]     — layer LSB
+    /// [65..72]:  adrs[8..15] — tree address
+    /// [73]:      adrs[19]    — type LSB
+    /// [74..77]:  adrs[20..23] — keypair
+    /// [78..81]:  adrs[24..27] — chain (fixed within this chain call)
+    /// [82..85]:  0,0,0,0     — hash field (only byte 85 updated per step)
+    /// [86..101]: 0..0        — message placeholder (16 bytes, updated per step)
     /// ```
     fun chain(
         sig: &vector<u8>,
@@ -141,71 +145,81 @@ module fips205::wots {
             return result
         };
 
-        // Build 86-byte prefix template for this chain.
-        // Only the hash field (positions 82-85) changes between steps.
-        let mut prefix_tpl = *padded_pk_seed;
-        prefix_tpl.push_back(adrs[3]);   // [64] layer LSB
-        prefix_tpl.push_back(adrs[8]);   // [65..72] tree address
-        prefix_tpl.push_back(adrs[9]);
-        prefix_tpl.push_back(adrs[10]);
-        prefix_tpl.push_back(adrs[11]);
-        prefix_tpl.push_back(adrs[12]);
-        prefix_tpl.push_back(adrs[13]);
-        prefix_tpl.push_back(adrs[14]);
-        prefix_tpl.push_back(adrs[15]);
-        prefix_tpl.push_back(adrs[19]);  // [73] type LSB
-        prefix_tpl.push_back(adrs[20]);  // [74..77] keypair
-        prefix_tpl.push_back(adrs[21]);
-        prefix_tpl.push_back(adrs[22]);
-        prefix_tpl.push_back(adrs[23]);
-        prefix_tpl.push_back(adrs[24]);  // [78..81] chain
-        prefix_tpl.push_back(adrs[25]);
-        prefix_tpl.push_back(adrs[26]);
-        prefix_tpl.push_back(adrs[27]);
-        prefix_tpl.push_back(0u8);       // [82..85] hash placeholder
-        prefix_tpl.push_back(0u8);
-        prefix_tpl.push_back(0u8);
-        prefix_tpl.push_back(0u8);
-
-        let to_pop = 32 - n;
+        // Build 102-byte input template for this chain.
+        // Prefix (86 bytes): padded_pk_seed(64) + compressed ADRS(22)
+        // Message (16 bytes): placeholder zeros, overwritten per step via borrow_mut
+        let mut input_tpl = *padded_pk_seed;
+        // Compressed ADRS (22 bytes, positions 64-85)
+        input_tpl.push_back(adrs[3]);   // [64] layer LSB
+        input_tpl.push_back(adrs[8]);   // [65..72] tree address
+        input_tpl.push_back(adrs[9]);
+        input_tpl.push_back(adrs[10]);
+        input_tpl.push_back(adrs[11]);
+        input_tpl.push_back(adrs[12]);
+        input_tpl.push_back(adrs[13]);
+        input_tpl.push_back(adrs[14]);
+        input_tpl.push_back(adrs[15]);
+        input_tpl.push_back(adrs[19]);  // [73] type LSB
+        input_tpl.push_back(adrs[20]);  // [74..77] keypair
+        input_tpl.push_back(adrs[21]);
+        input_tpl.push_back(adrs[22]);
+        input_tpl.push_back(adrs[23]);
+        input_tpl.push_back(adrs[24]);  // [78..81] chain
+        input_tpl.push_back(adrs[25]);
+        input_tpl.push_back(adrs[26]);
+        input_tpl.push_back(adrs[27]);
+        input_tpl.push_back(0u8);       // [82..85] hash (only byte 85 changes)
+        input_tpl.push_back(0u8);
+        input_tpl.push_back(0u8);
+        input_tpl.push_back(0u8);
+        // Message placeholder (16 bytes, positions 86-101)
+        input_tpl.push_back(0u8);
+        input_tpl.push_back(0u8);
+        input_tpl.push_back(0u8);
+        input_tpl.push_back(0u8);
+        input_tpl.push_back(0u8);
+        input_tpl.push_back(0u8);
+        input_tpl.push_back(0u8);
+        input_tpl.push_back(0u8);
+        input_tpl.push_back(0u8);
+        input_tpl.push_back(0u8);
+        input_tpl.push_back(0u8);
+        input_tpl.push_back(0u8);
+        input_tpl.push_back(0u8);
+        input_tpl.push_back(0u8);
+        input_tpl.push_back(0u8);
+        input_tpl.push_back(0u8);
 
         // First step: read message from sig at offset
-        let mut input = prefix_tpl;
-        let hv0 = (start as u32);
-        *input.borrow_mut(82) = ((hv0 >> 24) as u8);
-        *input.borrow_mut(83) = (((hv0 >> 16) & 0xFF) as u8);
-        *input.borrow_mut(84) = (((hv0 >> 8) & 0xFF) as u8);
-        *input.borrow_mut(85) = ((hv0 & 0xFF) as u8);
+        let mut input = input_tpl;
+        // Hash step fits in one byte for all FIPS 205 variants (w ≤ 256)
+        *input.borrow_mut(85) = (start as u8);
         let mut i = 0;
         while (i < n) {
-            input.push_back(sig[sig_offset + i]);
+            *input.borrow_mut(86 + i) = sig[sig_offset + i];
             i = i + 1;
         };
-        let mut digest = hash::sha2_256(input);
-        i = 0;
-        while (i < to_pop) { digest.pop_back(); i = i + 1; };
-        let mut tmp = digest;
+        // Don't truncate intermediate results — next step reads only first n bytes
+        let mut tmp = hash::sha2_256(input);  // 32 bytes
 
-        // Remaining steps: read message from previous output
+        // Remaining steps: read message from previous hash output
         let mut j = start + 1;
         while (j < start + steps) {
-            let hv = (j as u32);
-            let mut inp = prefix_tpl;
-            *inp.borrow_mut(82) = ((hv >> 24) as u8);
-            *inp.borrow_mut(83) = (((hv >> 16) & 0xFF) as u8);
-            *inp.borrow_mut(84) = (((hv >> 8) & 0xFF) as u8);
-            *inp.borrow_mut(85) = ((hv & 0xFF) as u8);
+            let mut inp = input_tpl;
+            *inp.borrow_mut(85) = (j as u8);
             i = 0;
             while (i < n) {
-                inp.push_back(tmp[i]);
+                *inp.borrow_mut(86 + i) = tmp[i];
                 i = i + 1;
             };
-            let mut d = hash::sha2_256(inp);
-            i = 0;
-            while (i < to_pop) { d.pop_back(); i = i + 1; };
-            tmp = d;
+            tmp = hash::sha2_256(inp);  // 32 bytes, skip truncation
             j = j + 1;
         };
+
+        // Truncate only the final result to n bytes
+        let to_pop = tmp.length() - n;
+        i = 0;
+        while (i < to_pop) { tmp.pop_back(); i = i + 1; };
         tmp
     }
 }
