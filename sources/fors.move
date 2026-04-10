@@ -5,13 +5,16 @@
 /// The message digest provides an a-bit index into each tree.
 ///
 /// ## Gas Optimizations
-/// - Reads secret leaves and auth path nodes directly from `sig` at offsets
-///   using `f_from` and `h_*_from`, eliminating all intermediate slice vectors.
+/// - Reads secret leaves via `f_from` directly from sig at offsets.
+/// - Fused auth path walk: builds a 118-byte H template once (reused across
+///   all k trees), per level copies the template and writes height/index/messages
+///   via borrow_mut. Skips intermediate truncation.
 /// - Uses push_back loops instead of append for root accumulation.
 ///
 /// ## Reference
 /// FIPS 205 Algorithm 17 (fors_pkFromSig)
 module fips205::fors {
+    use std::hash;
     use fips205::adrs;
     use fips205::thash;
     use fips205::utils;
@@ -43,6 +46,42 @@ module fips205::fors {
         // Extract k leaf indices, each a bits, from md
         let indices = utils::base_2b(md, a, k);
 
+        // Build 118-byte H template for auth path walks.
+        // Layer, tree_addr, type(FORS_TREE), keypair are constant across all k trees.
+        // Tree_height and tree_index change per level (written via borrow_mut).
+        let mut h_tpl = *padded_pk_seed;
+        h_tpl.push_back(adrs[3]);   // [64] layer LSB
+        h_tpl.push_back(adrs[8]);   // [65..72] tree address
+        h_tpl.push_back(adrs[9]);
+        h_tpl.push_back(adrs[10]);
+        h_tpl.push_back(adrs[11]);
+        h_tpl.push_back(adrs[12]);
+        h_tpl.push_back(adrs[13]);
+        h_tpl.push_back(adrs[14]);
+        h_tpl.push_back(adrs[15]);
+        h_tpl.push_back(adrs[19]);  // [73] type LSB (FORS_TREE=3)
+        h_tpl.push_back(adrs[20]);  // [74..77] keypair (= idx_leaf, set by caller)
+        h_tpl.push_back(adrs[21]);
+        h_tpl.push_back(adrs[22]);
+        h_tpl.push_back(adrs[23]);
+        h_tpl.push_back(0u8);       // [78..81] tree_height placeholder
+        h_tpl.push_back(0u8);
+        h_tpl.push_back(0u8);
+        h_tpl.push_back(0u8);
+        h_tpl.push_back(0u8);       // [82..85] tree_index placeholder
+        h_tpl.push_back(0u8);
+        h_tpl.push_back(0u8);
+        h_tpl.push_back(0u8);
+        // m1 + m2 placeholders (32 bytes, positions 86-117)
+        h_tpl.push_back(0u8); h_tpl.push_back(0u8); h_tpl.push_back(0u8); h_tpl.push_back(0u8);
+        h_tpl.push_back(0u8); h_tpl.push_back(0u8); h_tpl.push_back(0u8); h_tpl.push_back(0u8);
+        h_tpl.push_back(0u8); h_tpl.push_back(0u8); h_tpl.push_back(0u8); h_tpl.push_back(0u8);
+        h_tpl.push_back(0u8); h_tpl.push_back(0u8); h_tpl.push_back(0u8); h_tpl.push_back(0u8);
+        h_tpl.push_back(0u8); h_tpl.push_back(0u8); h_tpl.push_back(0u8); h_tpl.push_back(0u8);
+        h_tpl.push_back(0u8); h_tpl.push_back(0u8); h_tpl.push_back(0u8); h_tpl.push_back(0u8);
+        h_tpl.push_back(0u8); h_tpl.push_back(0u8); h_tpl.push_back(0u8); h_tpl.push_back(0u8);
+        h_tpl.push_back(0u8); h_tpl.push_back(0u8); h_tpl.push_back(0u8); h_tpl.push_back(0u8);
+
         // Accumulate tree roots (flat, k * n bytes)
         let mut roots = vector[];
 
@@ -51,36 +90,56 @@ module fips205::fors {
             let tree_offset = fors_offset + i * tree_sig_size;
 
             // Compute leaf hash — read secret directly from sig at offset
+            // (f_from still uses adrs directly, only 14 calls so not worth fusing)
             adrs::set_tree_height(adrs, 0);
             adrs::set_tree_index(adrs, ((i * leaves_per_tree + indices[i]) as u32));
             let mut node = thash::f_from(padded_pk_seed, adrs, sig, tree_offset, p);
 
-            // Walk authentication path upward (a levels)
-            // Read auth nodes directly from sig at offsets
+            // Fused auth path walk (a levels) using template
+            let mut ti = (i * leaves_per_tree + indices[i]);
             let mut j: u64 = 0;
             while (j < a) {
                 let auth_offset = tree_offset + n + j * n;
 
-                adrs::set_tree_height(adrs, ((j + 1) as u32));
-
-                if ((indices[i] >> (j as u8)) & 1 == 0) {
-                    let ti = adrs::get_tree_index(adrs);
-                    adrs::set_tree_index(adrs, ti / 2);
-                    node = thash::h_right_from(
-                        padded_pk_seed, adrs, &node, sig, auth_offset, p,
-                    );
+                // Compute new tree_index
+                let even = (indices[i] >> (j as u8)) & 1 == 0;
+                if (even) {
+                    ti = ti / 2;
                 } else {
-                    let ti = adrs::get_tree_index(adrs);
-                    adrs::set_tree_index(adrs, (ti - 1) / 2);
-                    node = thash::h_left_from(
-                        padded_pk_seed, adrs, sig, auth_offset, &node, p,
-                    );
+                    ti = (ti - 1) / 2;
                 };
+
+                let mut input = h_tpl;
+                // Update tree_height (position 81, height < 256)
+                *input.borrow_mut(81) = ((j + 1) as u8);
+                // Update tree_index (positions 82-85)
+                let ti32 = (ti as u32);
+                *input.borrow_mut(82) = ((ti32 >> 24) as u8);
+                *input.borrow_mut(83) = (((ti32 >> 16) & 0xFF) as u8);
+                *input.borrow_mut(84) = (((ti32 >> 8) & 0xFF) as u8);
+                *input.borrow_mut(85) = ((ti32 & 0xFF) as u8);
+
+                // Write m1 (left child) and m2 (right child) via borrow_mut
+                let mut m = 0;
+                if (even) {
+                    // node is left, auth from sig is right
+                    while (m < n) { *input.borrow_mut(86 + m) = node[m]; m = m + 1; };
+                    m = 0;
+                    while (m < n) { *input.borrow_mut(102 + m) = sig[auth_offset + m]; m = m + 1; };
+                } else {
+                    // auth from sig is left, node is right
+                    while (m < n) { *input.borrow_mut(86 + m) = sig[auth_offset + m]; m = m + 1; };
+                    m = 0;
+                    while (m < n) { *input.borrow_mut(102 + m) = node[m]; m = m + 1; };
+                };
+
+                // Hash — skip truncation for intermediate levels
+                node = hash::sha2_256(input);
 
                 j = j + 1;
             };
 
-            // Push node bytes directly instead of append
+            // Push first n bytes of node into roots (node may be 32 bytes if untruncated)
             let mut j = 0;
             while (j < n) {
                 roots.push_back(node[j]);
