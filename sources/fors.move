@@ -8,6 +8,10 @@
 /// (a sibling hashes) recomputes the tree root. All k roots are compressed into
 /// a single FORS public key via T_k.
 ///
+/// ## Gas Optimizations
+/// - `padded_pk_seed` is precomputed once and threaded through.
+/// - `roots.append(node)` replaced with push_back loops.
+///
 /// ## Reference
 /// FIPS 205 Algorithm 17 (fors_pkFromSig)
 module fips205::fors {
@@ -20,7 +24,7 @@ module fips205::fors {
     ///
     /// `sig_fors`: `k * (1 + a) * n` flat bytes.
     /// `md`:       `ceil(k * a / 8)` bytes of message digest.
-    /// `pk_seed`:  n bytes.
+    /// `padded_pk_seed`: precomputed pk_seed || zeros (64 bytes).
     /// `adrs`:     must have type=FORS_TREE, tree and keypair set.
     ///
     /// Returns the n-byte FORS public key.
@@ -28,7 +32,7 @@ module fips205::fors {
     public(package) fun fors_pk_from_sig(
         sig_fors: &vector<u8>,
         md: &vector<u8>,
-        pk_seed: &vector<u8>,
+        padded_pk_seed: &vector<u8>,
         adrs: &mut vector<u8>,
         p: &Params,
     ): vector<u8> {
@@ -52,7 +56,7 @@ module fips205::fors {
             // Compute leaf hash
             adrs::set_tree_height(adrs, 0);
             adrs::set_tree_index(adrs, ((i * leaves_per_tree + indices[i]) as u32));
-            let mut node = thash::f(pk_seed, adrs, &sk, p);
+            let mut node = thash::f(padded_pk_seed, adrs, &sk, p);
 
             // Walk authentication path upward (a levels)
             let mut j: u64 = 0;
@@ -65,17 +69,22 @@ module fips205::fors {
                 if ((indices[i] >> (j as u8)) & 1 == 0) {
                     let ti = adrs::get_tree_index(adrs);
                     adrs::set_tree_index(adrs, ti / 2);
-                    node = thash::h(pk_seed, adrs, &node, &auth_node, p);
+                    node = thash::h(padded_pk_seed, adrs, &node, &auth_node, p);
                 } else {
                     let ti = adrs::get_tree_index(adrs);
                     adrs::set_tree_index(adrs, (ti - 1) / 2);
-                    node = thash::h(pk_seed, adrs, &auth_node, &node, p);
+                    node = thash::h(padded_pk_seed, adrs, &auth_node, &node, p);
                 };
 
                 j = j + 1;
             };
 
-            roots.append(node);
+            // Push node bytes directly instead of append
+            let mut j = 0;
+            while (j < n) {
+                roots.push_back(node[j]);
+                j = j + 1;
+            };
             i = i + 1;
         };
 
@@ -83,6 +92,6 @@ module fips205::fors {
         let kp = adrs::get_keypair(adrs);
         adrs::set_type_and_clear(adrs, adrs::type_fors_roots());
         adrs::set_keypair(adrs, kp);
-        thash::t_l(pk_seed, adrs, &roots, p)
+        thash::t_l(padded_pk_seed, adrs, &roots, p)
     }
 }

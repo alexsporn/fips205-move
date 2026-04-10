@@ -10,6 +10,11 @@
 /// ## Gas Dominance
 /// WOTS+ chain computation accounts for ~85% of total verification cost.
 ///
+/// ## Gas Optimizations
+/// - `padded_pk_seed` is precomputed once and threaded through.
+/// - `tmp.append(node)` replaced with push_back loops to avoid reverse overhead.
+/// - `chain` calls thash::f which uses the optimized prefix construction.
+///
 /// ## References
 /// - FIPS 205 Algorithm 5 (chain)
 /// - FIPS 205 Algorithm 8 (wots_pkFromSig)
@@ -23,7 +28,7 @@ module fips205::wots {
     ///
     /// `sig_wots`: `len * n` flat bytes (chain values).
     /// `msg`:      n bytes (message to verify).
-    /// `pk_seed`:  n bytes.
+    /// `padded_pk_seed`: precomputed pk_seed || zeros (64 bytes).
     /// `adrs`:     must have type=WOTS_HASH and key pair set.
     ///
     /// Returns the n-byte WOTS+ public key.
@@ -31,7 +36,7 @@ module fips205::wots {
     public(package) fun wots_pk_from_sig(
         sig_wots: &vector<u8>,
         msg: &vector<u8>,
-        pk_seed: &vector<u8>,
+        padded_pk_seed: &vector<u8>,
         adrs: &mut vector<u8>,
         p: &Params,
     ): vector<u8> {
@@ -54,7 +59,6 @@ module fips205::wots {
         };
 
         // Step 3: left-shift checksum
-        // Shift = (8 - ((len2 * lgw) % 8)) % 8
         let shift = (8 - ((len2 * lgw) % 8)) % 8;
         csum = csum << (shift as u8);
 
@@ -69,6 +73,7 @@ module fips205::wots {
         };
 
         // Step 5: complete each chain from signature value to endpoint
+        // Use push_back instead of append to avoid vector::reverse overhead
         let mut tmp = vector[];
         i = 0;
         while (i < len) {
@@ -76,8 +81,13 @@ module fips205::wots {
             let sig_i = utils::slice(sig_wots, i * n, (i + 1) * n);
             let start = lengths[i];
             let steps = w - 1 - start;
-            let node = chain(&sig_i, start, steps, pk_seed, adrs, p);
-            tmp.append(node);
+            let node = chain(&sig_i, start, steps, padded_pk_seed, adrs, p);
+            // Push node bytes directly instead of append
+            let mut j = 0;
+            while (j < n) {
+                tmp.push_back(node[j]);
+                j = j + 1;
+            };
             i = i + 1;
         };
 
@@ -85,7 +95,7 @@ module fips205::wots {
         let kp = adrs::get_keypair(adrs);
         adrs::set_type_and_clear(adrs, adrs::type_wots_pk());
         adrs::set_keypair(adrs, kp);
-        thash::t_l(pk_seed, adrs, &tmp, p)
+        thash::t_l(padded_pk_seed, adrs, &tmp, p)
     }
 
     /// WOTS+ chain function (FIPS 205 Algorithm 5).
@@ -96,7 +106,7 @@ module fips205::wots {
         x: &vector<u8>,
         start: u64,
         steps: u64,
-        pk_seed: &vector<u8>,
+        padded_pk_seed: &vector<u8>,
         adrs: &mut vector<u8>,
         p: &Params,
     ): vector<u8> {
@@ -104,7 +114,7 @@ module fips205::wots {
         let mut j = start;
         while (j < start + steps) {
             adrs::set_hash(adrs, (j as u32));
-            tmp = thash::f(pk_seed, adrs, &tmp, p);
+            tmp = thash::f(padded_pk_seed, adrs, &tmp, p);
             j = j + 1;
         };
         tmp

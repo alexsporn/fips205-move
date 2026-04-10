@@ -14,6 +14,12 @@
 /// 6. Extract FORS indices (`md`), tree index, and leaf index from the digest
 /// 7. Recover the FORS public key from the FORS signature
 /// 8. Verify the hypertree signature chains up to `pk_root`
+///
+/// ## Gas Optimizations
+///
+/// The padded PK.seed (`pk_seed || zeros(48)`) is precomputed once here and
+/// threaded through the entire call chain (ht -> xmss -> wots -> thash),
+/// eliminating ~2,188 redundant zero-padding constructions.
 module fips205::slh_dsa {
     use fips205::adrs;
     use fips205::thash;
@@ -47,8 +53,18 @@ module fips205::slh_dsa {
         // Construct context-wrapped message for "pure" variant (Algorithm 20):
         // M' = toByte(0, 1) || toByte(|ctx|, 1) || ctx || M
         let mut wrapped_msg = vector[0u8, (ctx.length() as u8)];
-        wrapped_msg.append(*ctx);
-        wrapped_msg.append(*msg);
+        let ctx_len = ctx.length();
+        let mut i = 0;
+        while (i < ctx_len) {
+            wrapped_msg.push_back(ctx[i]);
+            i = i + 1;
+        };
+        let msg_len = msg.length();
+        i = 0;
+        while (i < msg_len) {
+            wrapped_msg.push_back(msg[i]);
+            i = i + 1;
+        };
 
         verify_internal(&wrapped_msg, sig, pk, p)
     }
@@ -75,13 +91,16 @@ module fips205::slh_dsa {
         let pk_seed = utils::slice(pk, 0, n);
         let pk_root = utils::slice(pk, n, 2 * n);
 
+        // Precompute padded pk_seed once for entire verification
+        let padded_pk_seed = thash::pad_pk_seed(&pk_seed, p);
+
         // Parse signature: R(n) || sig_fors || sig_ht
         let r = utils::slice(sig, 0, n);
         let fors_end = n + params::fors_sig_len(p);
         let sig_fors = utils::slice(sig, n, fors_end);
         let sig_ht = utils::slice(sig, fors_end, params::sig_len(p));
 
-        // Compute m-byte message digest
+        // Compute m-byte message digest (uses raw pk_seed, not padded)
         let digest = thash::h_msg(&r, &pk_seed, &pk_root, msg, p);
 
         // Split digest: md || idx_tree_bytes || idx_leaf_bytes
@@ -108,10 +127,10 @@ module fips205::slh_dsa {
 
         // Recover FORS public key from signature
         let pk_fors = fors::fors_pk_from_sig(
-            &sig_fors, &md, &pk_seed, &mut sig_adrs, p,
+            &sig_fors, &md, &padded_pk_seed, &mut sig_adrs, p,
         );
 
         // Verify hypertree signature
-        ht::ht_verify(&pk_fors, &sig_ht, &pk_seed, idx_tree, idx_leaf, &pk_root, p)
+        ht::ht_verify(&pk_fors, &sig_ht, &padded_pk_seed, idx_tree, idx_leaf, &pk_root, p)
     }
 }

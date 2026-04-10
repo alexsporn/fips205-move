@@ -22,7 +22,7 @@ module fips205::xmss {
     /// `sig_xmss`: `(len + hp) * n` flat bytes (WOTS+ sig + auth path).
     /// `idx`:      leaf index within this XMSS tree (0 .. 2^hp - 1).
     /// `msg`:      n bytes (leaf value to verify).
-    /// `pk_seed`:  n bytes.
+    /// `padded_pk_seed`: precomputed pk_seed || zeros (64 bytes).
     /// `adrs`:     must have layer and tree address set.
     ///
     /// Returns the n-byte tree root.
@@ -31,7 +31,7 @@ module fips205::xmss {
         idx: u32,
         sig_xmss: &vector<u8>,
         msg: &vector<u8>,
-        pk_seed: &vector<u8>,
+        padded_pk_seed: &vector<u8>,
         adrs: &mut vector<u8>,
         p: &Params,
     ): vector<u8> {
@@ -43,7 +43,7 @@ module fips205::xmss {
         adrs::set_type_and_clear(adrs, adrs::type_wots_hash());
         adrs::set_keypair(adrs, idx);
         let wots_sig = utils::slice(sig_xmss, 0, len * n);
-        let mut node = wots::wots_pk_from_sig(&wots_sig, msg, pk_seed, adrs, p);
+        let mut node = wots::wots_pk_from_sig(&wots_sig, msg, padded_pk_seed, adrs, p);
 
         // Step 2: walk up the XMSS Merkle tree (hp levels)
         adrs::set_type_and_clear(adrs, adrs::type_tree());
@@ -59,11 +59,11 @@ module fips205::xmss {
             if (((idx as u64) >> (k as u8)) & 1 == 0) {
                 let ti = adrs::get_tree_index(adrs);
                 adrs::set_tree_index(adrs, ti / 2);
-                node = thash::h(pk_seed, adrs, &node, &auth_node, p);
+                node = thash::h(padded_pk_seed, adrs, &node, &auth_node, p);
             } else {
                 let ti = adrs::get_tree_index(adrs);
                 adrs::set_tree_index(adrs, (ti - 1) / 2);
-                node = thash::h(pk_seed, adrs, &auth_node, &node, p);
+                node = thash::h(padded_pk_seed, adrs, &auth_node, &node, p);
             };
 
             k = k + 1;

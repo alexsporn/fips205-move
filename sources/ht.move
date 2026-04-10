@@ -18,7 +18,7 @@ module fips205::ht {
     ///
     /// `msg`:       n bytes (the FORS public key).
     /// `sig_ht`:    `d * xmss_sig_len` flat bytes.
-    /// `pk_seed`:   n bytes.
+    /// `padded_pk_seed`: precomputed pk_seed || zeros (64 bytes).
     /// `idx_tree`:  tree index from message digest (h - hp bits).
     /// `idx_leaf`:  leaf index from message digest (hp bits).
     /// `pk_root`:   n bytes (expected root).
@@ -27,7 +27,7 @@ module fips205::ht {
     public(package) fun ht_verify(
         msg: &vector<u8>,
         sig_ht: &vector<u8>,
-        pk_seed: &vector<u8>,
+        padded_pk_seed: &vector<u8>,
         idx_tree: u64,
         idx_leaf: u32,
         pk_root: &vector<u8>,
@@ -44,7 +44,7 @@ module fips205::ht {
         // Layer 0
         let sig_0 = utils::slice(sig_ht, 0, xmss_sig_size);
         let mut node = xmss::xmss_pk_from_sig(
-            idx_leaf, &sig_0, msg, pk_seed, &mut ht_adrs, p,
+            idx_leaf, &sig_0, msg, padded_pk_seed, &mut ht_adrs, p,
         );
 
         // Layers 1 .. d-1
@@ -58,7 +58,7 @@ module fips205::ht {
             let sig_offset = j * xmss_sig_size;
             let sig_j = utils::slice(sig_ht, sig_offset, sig_offset + xmss_sig_size);
             node = xmss::xmss_pk_from_sig(
-                leaf, &sig_j, &node, pk_seed, &mut ht_adrs, p,
+                leaf, &sig_j, &node, padded_pk_seed, &mut ht_adrs, p,
             );
             j = j + 1;
         };
