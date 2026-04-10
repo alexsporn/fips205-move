@@ -96,8 +96,8 @@ module fips205::slh_dsa {
 
         let idx_leaf_bits = params::idx_leaf_bits(p);
         let idx_leaf_mask = (1u64 << (idx_leaf_bits as u8)) - 1;
-        let idx_leaf = ((utils::to_int(&digest, md_len + idx_tree_len, idx_leaf_len))
-            & idx_leaf_mask as u32);
+        let idx_leaf = ((utils::to_int(&digest, md_len + idx_tree_len, idx_leaf_len)
+            & idx_leaf_mask) as u32);
 
         // Set up FORS address
         let mut sig_adrs = adrs::new();
